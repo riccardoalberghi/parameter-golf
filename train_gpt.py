@@ -183,9 +183,13 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
+                    shape = g.shape
+                    if g.ndim > 2:
+                        g = g.reshape(-1, shape[-1])
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    # Scale correction from Muon reference implementations.
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    g *= max(1, shape[-2] / shape[-1]) ** 0.5
+                    if len(shape) > 2:
+                        g = g.reshape(shape)
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
 
@@ -1203,22 +1207,27 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
-    )
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if monarch_factor_params:
+    muon_params = list(matrix_params)
+    if monarch_factor_params and args.monarch_optim == "muon":
+        muon_params.extend(monarch_factor_params)
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_scalar]
+    if muon_params:
+        optimizer_muon = Muon(
+            muon_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+        )
+        for group in optimizer_muon.param_groups:
+            group["base_lr"] = args.matrix_lr
+        optimizers.append(optimizer_muon)
+    if monarch_factor_params and args.monarch_optim != "muon":
         optimizer_monarch = MonarchBlockOptimizer(
             monarch_factor_params,
             lr=args.matrix_lr,
@@ -1366,9 +1375,10 @@ def main() -> None:
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
-        if monarch_factor_params:
+        if muon_params:
+            for group in optimizer_muon.param_groups:
+                group["momentum"] = muon_momentum
+        if monarch_factor_params and args.monarch_optim != "muon":
             for group in optimizer_monarch.param_groups:
                 group["momentum"] = muon_momentum
 
