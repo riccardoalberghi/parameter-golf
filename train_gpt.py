@@ -86,6 +86,17 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Monarch matrix factorization.
+    monarch_factors = int(os.environ.get("MONARCH_FACTORS", "0"))        # 0=off, 2=enabled
+    monarch_num_blocks = int(os.environ.get("MONARCH_NUM_BLOCKS", "4"))
+    monarch_mlp = bool(int(os.environ.get("MONARCH_MLP", "0")))
+    monarch_q = bool(int(os.environ.get("MONARCH_Q", "0")))
+    monarch_k = bool(int(os.environ.get("MONARCH_K", "0")))
+    monarch_v = bool(int(os.environ.get("MONARCH_V", "0")))
+    monarch_o = bool(int(os.environ.get("MONARCH_O", "0")))
+    monarch_optim = os.environ.get("MONARCH_OPTIM", "muon")              # muon/block_ns/block_svd/adamw
+    monarch_givens_quant = bool(int(os.environ.get("MONARCH_GIVENS_QUANT", "0")))  # Givens-angle quantization for B1
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -107,6 +118,28 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
         B = b * A + c * A @ A
         X = a * X + B @ X
     return X.T if transposed else X
+
+
+def zeropower_via_batched_svd(G: Tensor) -> Tensor:
+    # Orthogonalize each matrix in a batch via SVD: U @ Vh is nearest orthogonal.
+    U, _S, Vh = torch.linalg.svd(G.float(), full_matrices=False)
+    return (U @ Vh).to(G.dtype)
+
+
+def zeropower_via_batched_ns5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
+    # Newton-Schulz orthogonalization applied per-matrix in a batch.
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    norms = X.flatten(1).norm(dim=1).unsqueeze(-1).unsqueeze(-1) + eps
+    X = X / norms
+    transposed = X.size(1) > X.size(2)
+    if transposed:
+        X = X.transpose(1, 2)
+    for _ in range(steps):
+        A = X @ X.transpose(1, 2)
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    return X.transpose(1, 2) if transposed else X
 
 
 class Muon(torch.optim.Optimizer):
@@ -153,6 +186,79 @@ class Muon(torch.optim.Optimizer):
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+                curr += p.numel()
+
+            if distributed:
+                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+            curr = 0
+            for p in params:
+                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                p.add_(g, alpha=-lr)
+                curr += p.numel()
+
+        return loss
+
+
+class MonarchBlockOptimizer(torch.optim.Optimizer):
+    # Optimizer for 3D monarch block-diagonal factors.
+    # Supports modes: muon (NS5 on 2D reshape), block_ns, block_svd, adamw.
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int,
+                 mode: str = "block_svd", nesterov: bool = True):
+        super().__init__(
+            params,
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps,
+                 mode=mode, nesterov=nesterov),
+        )
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        distributed = dist.is_available() and dist.is_initialized()
+        world_size = dist.get_world_size() if distributed else 1
+        rank = dist.get_rank() if distributed else 0
+
+        for group in self.param_groups:
+            params = group["params"]
+            if not params:
+                continue
+            lr = group["lr"]
+            momentum = group["momentum"]
+            backend_steps = group["backend_steps"]
+            mode = group["mode"]
+            nesterov = group["nesterov"]
+
+            total_params = sum(int(p.numel()) for p in params)
+            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+
+            curr = 0
+            for i, p in enumerate(params):
+                if i % world_size == rank and p.grad is not None:
+                    g = p.grad
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf = state["momentum_buffer"]
+                    buf.mul_(momentum).add_(g)
+                    if nesterov:
+                        g = g.add(buf, alpha=momentum)
+
+                    if mode == "block_svd":
+                        g = zeropower_via_batched_svd(g)
+                    elif mode == "block_ns":
+                        g = zeropower_via_batched_ns5(g, steps=backend_steps)
+                    elif mode == "muon":
+                        shape = g.shape
+                        g = zeropower_via_newtonschulz5(g.reshape(-1, shape[-1]), steps=backend_steps)
+                        g = g.reshape(shape)
+                    # mode == "adamw": use momentum gradient as-is
+
+                    g *= max(1, g.shape[-2] / g.shape[-1]) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
 
@@ -320,6 +426,11 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
+    if t32.ndim == 3:
+        # Monarch block-diagonal factors: per-block-per-row quantization.
+        # Flatten (b, rows, cols) -> (b*rows, cols), quantize as 2D.
+        # The caller stores orig_shape in qmeta; dequant reshapes back to 3D.
+        return quantize_float_tensor(t32.reshape(-1, t32.shape[-1]))
     if t32.ndim == 2:
         # Matrices get one scale per row, which usually tracks output-channel
         # ranges much better than a single tensor-wide scale.
@@ -377,9 +488,16 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
+        orig_shape_3d = list(t.shape) if t.ndim == 3 else None
         q, s = quantize_float_tensor(t)
+        meta: dict[str, object] = {}
         if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
+            meta["scheme"] = "per_row"
+            meta["axis"] = 0
+        if orig_shape_3d is not None:
+            meta["orig_shape"] = orig_shape_3d
+        if meta:
+            qmeta[name] = meta
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
@@ -412,6 +530,10 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         else:
             scale = float(s.item())
             out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
+        # Restore original 3D shape for monarch factors.
+        orig_shape = qmeta.get(name, {}).get("orig_shape")
+        if orig_shape is not None:
+            out[name] = out[name].reshape(orig_shape).contiguous()
     for name, t in obj["passthrough"].items():
         # Restore small tensors, undoing the temporary fp16 storage cast if needed.
         out_t = t.detach().to("cpu").contiguous()
@@ -423,7 +545,128 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 
 
 # -----------------------------
-# DATA LOADING 
+# GIVENS-ANGLE REPARAMETERIZATION FOR MONARCH QUANTIZATION
+# -----------------------------
+# The MonarchBlockOptimizer keeps both B1 and B2 quasi-orthogonal via SVD/NS5
+# zeropower.  Quantizing raw entries breaks that structure.  Instead we
+# decompose each (b, p, q) factor into Givens rotation angles:
+#   p <= q (wide/square, orthonormal rows):  column rotations  -> [D | 0]
+#   p >  q (tall, orthonormal cols):         row rotations     -> [D; 0]
+# producing min(p,q)*(2*max(p,q)-min(p,q)-1)/2 angles + min(p,q) sign bits.
+# Angles are int8 at fixed pi/127 scale; signs are bit-packed uint8.
+
+_GIVENS_ANGLE_SCALE = math.pi / 127.0
+
+def _orthogonal_to_givens(M: Tensor) -> tuple[Tensor, Tensor]:
+    """Decompose (b, p, q) orthonormal matrices into Givens angles + signs."""
+    b, p, q = M.shape
+    R = M.float().clone()
+    angles: list[Tensor] = []
+    if p <= q:
+        # Orthonormal rows: zero entries right-to-left via column rotations.
+        for i in range(p):
+            for j in range(q - 1, i, -1):
+                a, bv = R[:, i, j - 1], R[:, i, j]
+                theta = torch.atan2(bv, a)
+                angles.append(theta)
+                c = torch.cos(theta).unsqueeze(1)
+                s = torch.sin(theta).unsqueeze(1)
+                cl, cr = R[:, :, j - 1].clone(), R[:, :, j].clone()
+                R[:, :, j - 1] = c * cl + s * cr
+                R[:, :, j] = -s * cl + c * cr
+    else:
+        # Orthonormal cols: zero entries bottom-to-top via row rotations.
+        for j in range(q):
+            for i in range(p - 1, j, -1):
+                a, bv = R[:, i - 1, j], R[:, i, j]
+                theta = torch.atan2(bv, a)
+                angles.append(theta)
+                c = torch.cos(theta).unsqueeze(1)
+                s = torch.sin(theta).unsqueeze(1)
+                rt, rb = R[:, i - 1, :].clone(), R[:, i, :].clone()
+                R[:, i - 1, :] = c * rt + s * rb
+                R[:, i, :] = -s * rt + c * rb
+    k = min(p, q)
+    signs = torch.sign(R[:, range(k), range(k)])
+    signs[signs == 0] = 1.0
+    return torch.stack(angles, dim=1), signs
+
+def _givens_to_orthogonal(angles: Tensor, signs: Tensor, p: int, q: int) -> Tensor:
+    """Reconstruct (b, p, q) orthonormal matrices from Givens angles + signs."""
+    b = angles.shape[0]
+    k = min(p, q)
+    Q = torch.zeros(b, p, q, dtype=torch.float32, device=angles.device)
+    for i in range(k):
+        Q[:, i, i] = signs[:, i]
+    idx = angles.shape[1] - 1
+    if p <= q:
+        for i in range(p - 1, -1, -1):
+            for j in range(i + 1, q):
+                theta = angles[:, idx]; idx -= 1
+                c = torch.cos(theta).unsqueeze(1)
+                s = torch.sin(theta).unsqueeze(1)
+                cl, cr = Q[:, :, j - 1].clone(), Q[:, :, j].clone()
+                Q[:, :, j - 1] = c * cl - s * cr
+                Q[:, :, j] = s * cl + c * cr
+    else:
+        for j in range(q - 1, -1, -1):
+            for i in range(j + 1, p):
+                theta = angles[:, idx]; idx -= 1
+                c = torch.cos(theta).unsqueeze(1)
+                s = torch.sin(theta).unsqueeze(1)
+                rt, rb = Q[:, i - 1, :].clone(), Q[:, i, :].clone()
+                Q[:, i - 1, :] = c * rt - s * rb
+                Q[:, i, :] = s * rt + c * rb
+    return Q
+
+def _pack_signs(signs: Tensor) -> Tensor:
+    """Pack (b, n) float ±1 into (b, ceil(n/8)) uint8 bitfield."""
+    b, n = signs.shape
+    bits = (signs > 0).to(torch.uint8)
+    pad = (8 - n % 8) % 8
+    if pad:
+        bits = F.pad(bits, (0, pad))
+    bits = bits.view(b, -1, 8)
+    packed = torch.zeros(b, bits.shape[1], dtype=torch.uint8)
+    for i in range(8):
+        packed |= bits[:, :, i] << i
+    return packed
+
+def _unpack_signs(packed: Tensor, n: int) -> Tensor:
+    """Unpack (b, ceil(n/8)) uint8 bitfield to (b, n) float ±1."""
+    shifts = torch.arange(8, dtype=torch.uint8, device=packed.device)
+    bits = ((packed.unsqueeze(2) >> shifts) & 1).reshape(packed.shape[0], -1)[:, :n]
+    return bits.float() * 2 - 1
+
+def _state_dict_monarch_to_givens(sd: dict[str, Tensor]) -> tuple[dict[str, Tensor], dict]:
+    """Replace Monarch B1/B2 blocks with int8 Givens angles + bit-packed signs."""
+    out: dict[str, Tensor] = {}
+    givens_data: dict[str, dict] = {}
+    for name, t in sd.items():
+        if (name.endswith(".B1") or name.endswith(".B2")) and t.ndim == 3:
+            b, p, q = t.shape
+            angles, signs = _orthogonal_to_givens(t)
+            givens_data[name] = {
+                "angles_int8": torch.clamp(torch.round(angles / _GIVENS_ANGLE_SCALE), -127, 127).to(torch.int8),
+                "signs_packed": _pack_signs(signs),
+                "p": p, "q": q,
+            }
+        else:
+            out[name] = t
+    return out, givens_data
+
+def _state_dict_givens_to_monarch(sd: dict[str, Tensor], givens_data: dict) -> dict[str, Tensor]:
+    """Reconstruct Monarch B1/B2 blocks from int8 angles + packed signs."""
+    for name, gd in givens_data.items():
+        p, q = gd["p"], gd["q"]
+        angles = gd["angles_int8"].float() * _GIVENS_ANGLE_SCALE
+        signs = _unpack_signs(gd["signs_packed"], min(p, q))
+        sd[name] = _givens_to_orthogonal(angles, signs, p, q)
+    return sd
+
+
+# -----------------------------
+# DATA LOADING
 # -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
@@ -513,6 +756,72 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+class MonarchLinear(nn.Module):
+    # Linear layer W = blockdiag(B2) @ P @ blockdiag(B1) with 2 block-diagonal factors.
+    # Stores factors as 3D params, materializes dense W in forward for F.linear.
+    # Supports rectangular matrices: out_features and in_features may differ.
+    def __init__(self, in_features: int, out_features: int, num_blocks: int):
+        super().__init__()
+        b = num_blocks
+        m, n = out_features, in_features
+        if m % b != 0 or n % b != 0:
+            raise ValueError(
+                f"Monarch: out_features={m} and in_features={n} must be divisible by num_blocks={b}"
+            )
+        q = n // b
+        if q % b != 0:
+            raise ValueError(
+                f"Monarch: in_features/num_blocks={q} must be divisible by num_blocks={b} "
+                f"(i.e. num_blocks² must divide in_features)"
+            )
+        self.in_features = n
+        self.out_features = m
+        self.num_blocks = b
+        p = m // b
+        # B1 is square (endomorphism on input space), B2 handles dimension change.
+        self.B1 = nn.Parameter(torch.empty(b, q, q))
+        self.B2 = nn.Parameter(torch.empty(b, p, q))
+        self._init_factors()
+
+    def _init_factors(self) -> None:
+        # B1 orthogonal (Var=1/q), B2 Kaiming (Var=2/q), no extra scaling needed.
+        # Product variance: s * (1/q) * (2/q) = (q/b) * 2/q² = 2/(b*q) = 2/n (He init).
+        for factor in (self.B1, self.B2):
+            b, rows, cols = factor.shape
+            if rows == cols:
+                for i in range(b):
+                    nn.init.orthogonal_(factor.data[i])
+            else:
+                nn.init.kaiming_uniform_(factor.data.view(-1, cols))
+                factor.data = factor.data.view(b, rows, cols)
+
+    def _materialize_weight(self) -> Tensor:
+        b = self.num_blocks
+        n = self.in_features
+        m = self.out_features
+        q = n // b
+        p = m // b
+        s = q // b
+        # Decompose the 2-factor monarch product into b² small matmuls:
+        #   W[k*p:(k+1)*p, a*q:(a+1)*q] = B2[k, :, a::b] @ B1[a, k*s:(k+1)*s, :]
+        # Batched as a single bmm of b² pairs.
+        # B2.view(b, p, s, b): splits q cols into (s, b) so [:, :, :, a] = [:, :, a::b]
+        B2_r = self.B2.view(b, p, s, b).permute(0, 3, 1, 2).contiguous().view(b * b, p, s)
+        # B1.view(b, b, s, q): splits q rows into (b, s) so [a, k, :, :] = [a, k*s:(k+1)*s, :]
+        B1_r = self.B1.view(b, b, s, q).permute(1, 0, 2, 3).contiguous().view(b * b, s, q)
+        return torch.bmm(B2_r, B1_r).view(b, b, p, q).permute(0, 2, 1, 3).contiguous().view(m, n)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.linear(x, self._materialize_weight().to(x.dtype))
+
+
+def _make_linear(in_f: int, out_f: int, use_monarch: bool,
+                 monarch_num_blocks: int) -> nn.Module:
+    if use_monarch:
+        return MonarchLinear(in_f, out_f, monarch_num_blocks)
+    return CastedLinear(in_f, out_f, bias=False)
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -560,6 +869,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        monarch_cfg: dict | None = None,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -572,10 +882,11 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
+        mb = monarch_cfg["num_blocks"] if monarch_cfg else 1
+        self.c_q = _make_linear(dim, dim, monarch_cfg is not None and monarch_cfg["q"], mb)
+        self.c_k = _make_linear(dim, kv_dim, monarch_cfg is not None and monarch_cfg["k"], mb)
+        self.c_v = _make_linear(dim, kv_dim, monarch_cfg is not None and monarch_cfg["v"], mb)
+        self.proj = _make_linear(dim, dim, monarch_cfg is not None and monarch_cfg["o"], mb)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
@@ -605,11 +916,13 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, monarch_cfg: dict | None = None):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
+        mb = monarch_cfg["num_blocks"] if monarch_cfg else 1
+        use = monarch_cfg is not None and monarch_cfg["mlp"]
+        self.fc = _make_linear(dim, hidden, use, mb)
+        self.proj = _make_linear(hidden, dim, use, mb)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
@@ -626,12 +939,13 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        monarch_cfg: dict | None = None,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, monarch_cfg)
+        self.mlp = MLP(dim, mlp_mult, monarch_cfg)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -659,6 +973,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        monarch_cfg: dict | None = None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -680,6 +995,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    monarch_cfg,
                 )
                 for i in range(num_layers)
             ]
@@ -696,6 +1012,9 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+            if isinstance(module, MonarchLinear) and getattr(module, "_zero_init", False):
+                # Zero B2 so the materialized product is zero.
+                nn.init.zeros_(module.B2)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -823,6 +1142,16 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
+    monarch_cfg = None
+    if args.monarch_factors > 0:
+        monarch_cfg = dict(
+            num_blocks=args.monarch_num_blocks,
+            mlp=args.monarch_mlp,
+            q=args.monarch_q,
+            k=args.monarch_k,
+            v=args.monarch_v,
+            o=args.monarch_o,
+        )
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -835,9 +1164,12 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        monarch_cfg=monarch_cfg,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
+            module.float()
+        if isinstance(module, MonarchLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
@@ -847,18 +1179,21 @@ def main() -> None:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
+    # - monarch factor params use MonarchBlockOptimizer (mode from MONARCH_OPTIM)
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
+    monarch_factor_params: list[nn.Parameter] = []
+    matrix_params: list[nn.Parameter] = []
+    scalar_params: list[nn.Parameter] = []
+    for name, p in block_named_params:
+        if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+            scalar_params.append(p)
+        elif p.ndim == 3 and any(f in name for f in ("B1", "B2")):
+            monarch_factor_params.append(p)
+        elif p.ndim == 2:
+            matrix_params.append(p)
+        else:
+            scalar_params.append(p)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -883,6 +1218,17 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if monarch_factor_params:
+        optimizer_monarch = MonarchBlockOptimizer(
+            monarch_factor_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+            mode=args.monarch_optim,
+        )
+        for group in optimizer_monarch.param_groups:
+            group["base_lr"] = args.matrix_lr
+        optimizers.append(optimizer_monarch)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1022,6 +1368,9 @@ def main() -> None:
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
+        if monarch_factor_params:
+            for group in optimizer_monarch.param_groups:
+                group["momentum"] = muon_momentum
 
         for opt in optimizers:
             for group in opt.param_groups:
@@ -1073,7 +1422,13 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    _quant_sd = base_model.state_dict()
+    _givens_data: dict = {}
+    if args.monarch_givens_quant and args.monarch_factors > 0:
+        _quant_sd, _givens_data = _state_dict_monarch_to_givens(_quant_sd)
+    quant_obj, quant_stats = quantize_state_dict_int8(_quant_sd)
+    if _givens_data:
+        quant_obj["givens_data"] = _givens_data
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1096,7 +1451,11 @@ def main() -> None:
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    _dequant_sd = dequantize_state_dict_int8(quant_state)
+    _gd = quant_state.get("givens_data")
+    if _gd:
+        _dequant_sd = _state_dict_givens_to_monarch(_dequant_sd, _gd)
+    base_model.load_state_dict(_dequant_sd, strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
