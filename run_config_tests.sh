@@ -174,3 +174,73 @@ echo ""
 echo "=== Report written to $REPORT ==="
 echo ""
 cat "$REPORT"
+
+# ── Pareto plot ─────────────────────────────────────────────────────────────
+echo "=== Generating Pareto plot ==="
+
+python3 - "$LOGDIR" "${CONFIGS[@]}" <<'PYEOF'
+import sys, re, os
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+logdir = sys.argv[1]
+raw = sys.argv[2:]  # flat list: name, extra, name, extra, ...
+
+names, sizes_mb, bpbs = [], [], []
+for i in range(0, len(raw), 2):
+    name = raw[i]
+    logfile = os.path.join(logdir, f"{name}.log")
+    if not os.path.isfile(logfile):
+        continue
+    text = open(logfile).read()
+
+    # quantized val_bpb
+    m = re.findall(r"final_int8_zlib_roundtrip_exact.*?val_bpb:([0-9.]+)", text)
+    if not m:
+        continue
+    bpb = float(m[-1])
+
+    # .ptz model size in bytes → MB
+    m2 = re.findall(r"Serialized model int8\+zlib:\s*([0-9]+)", text)
+    if not m2:
+        continue
+    size = int(m2[-1]) / 1e6
+
+    names.append(name)
+    sizes_mb.append(size)
+    bpbs.append(bpb)
+
+if not names:
+    print("No valid data points for Pareto plot.")
+    sys.exit(0)
+
+# Pareto frontier (lower bpb is better → sort by size, keep running min bpb)
+pts = sorted(zip(sizes_mb, bpbs, names))
+frontier_x, frontier_y = [], []
+best = float("inf")
+for x, y, _ in pts:
+    if y <= best:
+        best = y
+        frontier_x.append(x)
+        frontier_y.append(y)
+
+fig, ax = plt.subplots(figsize=(10, 6))
+ax.scatter(sizes_mb, bpbs, s=80, zorder=3)
+for n, x, y in zip(names, sizes_mb, bpbs):
+    ax.annotate(n, (x, y), textcoords="offset points", xytext=(6, 6), fontsize=7)
+
+if len(frontier_x) > 1:
+    ax.plot(frontier_x, frontier_y, "r--", linewidth=1.5, label="Pareto frontier")
+    ax.legend()
+
+ax.set_xlabel("Model size (MB)")
+ax.set_ylabel("val_bpb (quantized)")
+ax.set_title("Config Sweep — Size vs val_bpb")
+ax.grid(True, alpha=0.3)
+fig.tight_layout()
+
+out = os.path.join(logdir, "pareto.png")
+fig.savefig(out, dpi=150)
+print(f"Pareto plot saved to {out}")
+PYEOF
