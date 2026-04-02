@@ -9,6 +9,18 @@
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
+# ── Environment setup via uv ────────────────────────────────────────────────
+echo "=== Setting up environment with uv ==="
+uv venv --python 3.12 .venv
+source .venv/bin/activate
+uv pip install torch --index-url https://download.pytorch.org/whl/cu128
+uv pip install -r requirements.txt
+
+# ── Download & build tokenizer ──────────────────────────────────────────────
+echo "=== Preparing tokenizer / data ==="
+uv run data/cached_challenge_fineweb.py --variant sp1024 --train-shards 10
+
+# ── Detect GPUs ─────────────────────────────────────────────────────────────
 NGPUS="${NGPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}"
 NGPUS="${NGPUS:-1}"
 WALLCLOCK="${QUICK:+120}"          # 2 min if QUICK=1, else default 600
