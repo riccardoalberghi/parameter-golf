@@ -42,41 +42,13 @@ COMMON=(
 # ── Test matrix ──────────────────────────────────────────────────────────────
 # Each entry: NAME  extra env vars (space-separated KEY=VALUE)
 declare -a CONFIGS=(
-  # 1. Monarch on attention (Q,K,V,O) — muon optim
-  "monarch_attn_muon"
-  "MONARCH_FACTORS=2 MONARCH_Q=1 MONARCH_K=1 MONARCH_V=1 MONARCH_O=1 MONARCH_OPTIM=muon"
-
-  # 2. Monarch on MLP only — muon optim
+  # 1. Monarch on MLP only
   "monarch_mlp_muon"
-  "MONARCH_FACTORS=2 MONARCH_MLP=1 MONARCH_OPTIM=muon"
+  "MONARCH_MLP=1"
 
-  # 3. Monarch on everything — muon optim
-  "monarch_all_muon"
-  "MONARCH_FACTORS=2 MONARCH_Q=1 MONARCH_K=1 MONARCH_V=1 MONARCH_O=1 MONARCH_MLP=1 MONARCH_OPTIM=muon"
-
-  # 4. Monarch on everything except K — muon optim
-  "monarch_all_no_k_muon"
-  "MONARCH_FACTORS=2 MONARCH_Q=1 MONARCH_V=1 MONARCH_O=1 MONARCH_MLP=1 MONARCH_OPTIM=muon"
-
-  # 5. Monarch on everything — block_svd optim
-  "monarch_all_block_svd"
-  "MONARCH_FACTORS=2 MONARCH_Q=1 MONARCH_K=1 MONARCH_V=1 MONARCH_O=1 MONARCH_MLP=1 MONARCH_OPTIM=block_svd"
-
-  # 6. Monarch on everything — block_ns optim
-  "monarch_all_block_ns"
-  "MONARCH_FACTORS=2 MONARCH_Q=1 MONARCH_K=1 MONARCH_V=1 MONARCH_O=1 MONARCH_MLP=1 MONARCH_OPTIM=block_ns"
-
-  # 7. Monarch on everything — muon + Givens quant
-  "monarch_all_muon_givens"
-  "MONARCH_FACTORS=2 MONARCH_Q=1 MONARCH_K=1 MONARCH_V=1 MONARCH_O=1 MONARCH_MLP=1 MONARCH_OPTIM=muon MONARCH_GIVENS_QUANT=1"
-
-  # 8. Upstream baseline — no monarch
+  # 2. Upstream baseline — no monarch
   "baseline"
   ""
-
-  # 9. Monarch on everything — block_svd + Givens quant
-  "monarch_all_block_svd_givens"
-  "MONARCH_FACTORS=2 MONARCH_Q=1 MONARCH_K=1 MONARCH_V=1 MONARCH_O=1 MONARCH_MLP=1 MONARCH_OPTIM=block_svd MONARCH_GIVENS_QUANT=1"
 )
 
 NUM_CONFIGS=$(( ${#CONFIGS[@]} / 2 ))
