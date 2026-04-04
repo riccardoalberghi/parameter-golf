@@ -88,6 +88,8 @@ class Hyperparameters:
 
     # Monarch matrix factorization (MLP only).
     monarch_mlp = bool(int(os.environ.get("MONARCH_MLP", "0")))
+    monarch_attn_proj = bool(int(os.environ.get("MONARCH_ATTN_PROJ", "0")))
+    monarch_svd = bool(int(os.environ.get("MONARCH_SVD", "0")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -128,11 +130,17 @@ def zeropower_via_batched_ns5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> 
     return X.transpose(1, 2) if transposed else X
 
 
+def zeropower_via_batched_svd(G: Tensor) -> Tensor:
+    # Batched SVD orthogonalization: returns U @ Vt for each matrix in the batch.
+    U, _, Vt = torch.linalg.svd(G.float(), full_matrices=False)
+    return (U @ Vt).bfloat16()
+
+
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, use_svd: bool = False):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, use_svd=use_svd),
         )
 
     @torch.no_grad()
@@ -170,8 +178,11 @@ class Muon(torch.optim.Optimizer):
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
                     if g.ndim == 3:
-                        # Monarch block-diagonal factors: NS5 per block.
-                        g = zeropower_via_batched_ns5(g, steps=backend_steps)
+                        # Monarch block-diagonal factors.
+                        if group["use_svd"]:
+                            g = zeropower_via_batched_svd(g)
+                        else:
+                            g = zeropower_via_batched_ns5(g, steps=backend_steps)
                     else:
                         g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     g *= max(1, g.shape[-2] / g.shape[-1]) ** 0.5
@@ -367,7 +378,103 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
+def _pack_sign_bits(t: Tensor) -> Tensor:
+    """Pack sign bits (>=0 -> 1, <0 -> 0) into uint8, 8 bits per byte."""
+    flat = (t.flatten() >= 0).to(torch.uint8)
+    pad = (8 - flat.numel() % 8) % 8
+    if pad:
+        flat = F.pad(flat, (0, pad))
+    return (flat.view(-1, 8) << torch.arange(8, dtype=torch.uint8)).sum(1, dtype=torch.uint8)
+
+def _unpack_sign_bits(packed: Tensor, numel: int) -> Tensor:
+    """Unpack uint8 sign bits back to +/-1 float tensor."""
+    bits = (packed.unsqueeze(1) >> torch.arange(8, dtype=torch.uint8)) & 1
+    return bits.flatten()[:numel].float() * 2.0 - 1.0
+
+def decompose_monarch_givens(t: Tensor) -> tuple[Tensor, Tensor, bool]:
+    """Decompose batch of ~orthogonal matrices into Givens rotation angles + diagonal signs.
+
+    An (m, n) orthogonal matrix (m >= n) has n(2m-n-1)/2 free rotation angles plus n sign bits,
+    which is strictly fewer parameters than m*n stored values.
+
+    Args:
+        t: (b, rows, cols) batch of approximately orthogonal matrices.
+    Returns:
+        angles:  (b, num_angles) float16 Givens rotation angles.
+        packed_signs: packed uint8 sign bits (b*min(rows,cols) signs total).
+        transposed: whether the input was transposed to make rows >= cols.
+    """
+    import math as _math
+
+    b, rows, cols = t.shape
+    transposed = rows < cols
+    work = t.transpose(-2, -1).contiguous() if transposed else t
+    if transposed:
+        rows, cols = cols, rows
+
+    all_angles = []
+    all_signs = []
+
+    for bi in range(b):
+        R = work[bi].clone().double()
+        angles = []
+        for j in range(cols):
+            for i in range(rows - 1, j, -1):
+                a, bv = R[i - 1, j].item(), R[i, j].item()
+                angle = _math.atan2(bv, a)
+                angles.append(angle)
+                c, s = _math.cos(angle), _math.sin(angle)
+                row_above = c * R[i - 1] + s * R[i]
+                row_curr = -s * R[i - 1] + c * R[i]
+                R[i - 1] = row_above
+                R[i] = row_curr
+
+        all_signs.append(torch.sign(R.diag()[:cols]))
+        all_angles.append(torch.tensor(angles, dtype=torch.float32))
+
+    angles_tensor = torch.stack(all_angles).to(torch.float16)   # (b, num_angles)
+    signs_flat = torch.cat(all_signs)                            # (b * cols,)
+    packed_signs = _pack_sign_bits(signs_flat)
+
+    return angles_tensor, packed_signs, transposed
+
+
+def reconstruct_monarch_givens(angles: Tensor, packed_signs: Tensor,
+                                orig_shape: list[int], transposed: bool) -> Tensor:
+    """Reconstruct batch of orthogonal matrices from Givens angles + signs."""
+    import math as _math
+
+    b, orig_rows, orig_cols = orig_shape
+    rows, cols = (orig_cols, orig_rows) if transposed else (orig_rows, orig_cols)
+
+    signs = _unpack_sign_bits(packed_signs, b * cols).reshape(b, cols)
+    angles = angles.float()
+
+    blocks = []
+    for bi in range(b):
+        R = torch.zeros(rows, cols, dtype=torch.float32)
+        for j in range(cols):
+            R[j, j] = signs[bi, j]
+
+        ang = angles[bi].tolist()
+        idx = len(ang) - 1
+        for j in range(cols - 1, -1, -1):
+            for i in range(j + 1, rows):
+                angle = ang[idx]
+                idx -= 1
+                c, s = _math.cos(angle), _math.sin(angle)
+                row_above = c * R[i - 1] - s * R[i]
+                row_curr = s * R[i - 1] + c * R[i]
+                R[i - 1] = row_above
+                R[i] = row_curr
+        blocks.append(R)
+
+    out = torch.stack(blocks)
+    if transposed:
+        out = out.transpose(-2, -1).contiguous()
+    return out.contiguous()
+
+def quantize_state_dict_int8(state_dict: dict[str, Tensor], givens_monarch: bool = False):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
     # - per-tensor int8 for other float tensors
@@ -394,6 +501,17 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = t
             stats["int8_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        # Monarch factors: Givens decomposition (angles + signs) when enabled.
+        # Must be checked before the small-tensor passthrough so it actually fires.
+        if t.ndim == 3 and givens_monarch:
+            stats["num_float_tensors"] += 1
+            angles, packed_signs, transposed = decompose_monarch_givens(t)
+            passthrough[name + "__givens_angles"] = angles
+            passthrough[name + "__givens_signs"] = packed_signs
+            qmeta[name] = {"scheme": "givens_angles", "orig_shape": list(t.shape), "transposed": transposed}
+            stats["int8_payload_bytes"] += tensor_nbytes(angles) + tensor_nbytes(packed_signs)
             continue
 
         # Small float tensors are cheap enough to keep directly. We still downcast
@@ -437,10 +555,21 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     qmeta = obj.get("qmeta", {})
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
+
+    # Reconstruct Givens-decomposed Monarch factors first.
+    for name, meta in qmeta.items():
+        if meta.get("scheme") == "givens_angles":
+            angles = obj["passthrough"][name + "__givens_angles"]
+            packed_signs = obj["passthrough"][name + "__givens_signs"]
+            out[name] = reconstruct_monarch_givens(
+                angles, packed_signs, meta["orig_shape"], meta["transposed"],
+            ).to(dtype=torch.bfloat16).contiguous()
+
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
+        meta = qmeta.get(name, {})
         s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+        if meta.get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
             # Broadcast the saved row scale back across trailing dimensions.
             out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
@@ -452,6 +581,8 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         if orig_shape is not None:
             out[name] = out[name].reshape(orig_shape).contiguous()
     for name, t in obj["passthrough"].items():
+        if "__givens_" in name:
+            continue
         # Restore small tensors, undoing the temporary fp16 storage cast if needed.
         out_t = t.detach().to("cpu").contiguous()
         orig_dtype = passthrough_orig_dtypes.get(name)
@@ -667,6 +798,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        monarch_cfg: dict | None = None,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -679,10 +811,11 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
+        use_monarch_proj = monarch_cfg is not None and monarch_cfg.get("attn_proj", False)
+        self.c_q = _make_linear(dim, dim, use_monarch_proj)
+        self.c_k = _make_linear(dim, kv_dim, use_monarch_proj)
+        self.c_v = _make_linear(dim, kv_dim, use_monarch_proj)
+        self.proj = _make_linear(dim, dim, use_monarch_proj)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
@@ -739,7 +872,7 @@ class Block(nn.Module):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, monarch_cfg)
         self.mlp = MLP(dim, mlp_mult, monarch_cfg)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -938,8 +1071,8 @@ def main() -> None:
     # -----------------------------
 
     monarch_cfg = None
-    if args.monarch_mlp:
-        monarch_cfg = dict(mlp=True)
+    if args.monarch_mlp or args.monarch_attn_proj:
+        monarch_cfg = dict(mlp=args.monarch_mlp, attn_proj=args.monarch_attn_proj)
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -1007,6 +1140,7 @@ def main() -> None:
             lr=args.matrix_lr,
             momentum=args.muon_momentum,
             backend_steps=args.muon_backend_steps,
+            use_svd=args.monarch_svd,
         )
         for group in optimizer_muon.param_groups:
             group["base_lr"] = args.matrix_lr
@@ -1203,7 +1337,7 @@ def main() -> None:
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
     _quant_sd = base_model.state_dict()
-    quant_obj, quant_stats = quantize_state_dict_int8(_quant_sd)
+    quant_obj, quant_stats = quantize_state_dict_int8(_quant_sd, givens_monarch=args.monarch_svd)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()

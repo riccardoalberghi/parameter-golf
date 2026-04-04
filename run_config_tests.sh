@@ -46,7 +46,19 @@ declare -a CONFIGS=(
   "monarch_mlp_muon"
   "MONARCH_MLP=1"
 
-  # 2. Upstream baseline — no monarch
+  # 2. Monarch MLP + attn proj
+  "monarch_mlp_attn"
+  "MONARCH_MLP=1 MONARCH_ATTN_PROJ=1"
+
+  # 3. Monarch MLP with SVD + Givens quantization
+  "monarch_mlp_svd_givens"
+  "MONARCH_MLP=1 MONARCH_SVD=1"
+
+  # 4. Monarch MLP + attn proj with SVD + Givens
+  "monarch_all_svd_givens"
+  "MONARCH_MLP=1 MONARCH_ATTN_PROJ=1 MONARCH_SVD=1"
+
+  # 5. Upstream baseline — no monarch
   "baseline"
   ""
 )
